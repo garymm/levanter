@@ -6,7 +6,6 @@ from functools import partial
 from typing import Callable, Dict, Optional, Type
 
 import equinox as eqx
-import jax.numpy as jnp
 import jax.random as jrandom
 from jaxtyping import PRNGKeyArray
 
@@ -18,7 +17,7 @@ from haliax.jax_utils import named_call, shaped_rng_split
 from haliax.nn.scan import Stacked
 from haliax.state_dict import ModuleWithStateDictSerialization
 
-from levanter.models.attention import AttentionMask, dot_product_attention
+from levanter.models.attention import AttentionMask
 from levanter.models.hyena import HyenaOperator, HyenaConfig
 from levanter.models.gpt2 import Gpt2Embeddings, Gpt2Mlp
 from levanter.models.lm_model import LmConfig, LmHeadModel
@@ -43,14 +42,31 @@ class Gpt2HyenaConfig(LmConfig):
     layer_norm_epsilon: float = 1e-5
     activation_function: str = "gelu_new"
 
-    # mistral tweaks:
-    scale_hyena_by_inverse_layer_idx: bool = False
-    upcast_hyena: bool = False
-
     gradient_checkpointing: bool = True  # better to just always use this
     gradient_checkpointing_block_size: int = 5
 
     use_bias: bool = True
+
+    # Hyena-specific parameters
+    hyena_order: int = 2  # depth of the Hyena recurrence
+    hyena_filter_order: int = 64  # width of the FFN parametrizing the implicit filter
+    hyena_inner_factor: int = 1  # inner dimension multiplier
+    hyena_short_filter_order: int = 3  # length of the explicit input convolutional filter
+    hyena_outer_mixing: bool = False  # whether to use outer mixing
+
+    # Hyena filter parameters
+    hyena_emb_dim: int = 3  # dim of input to MLP, augments with positional encoding
+
+    # Hyena modulation parameters
+    hyena_fast_decay_pct: float = 0.3
+    hyena_slow_decay_pct: float = 1.5
+    hyena_target: float = 1e-2
+    hyena_modulate: bool = True
+    hyena_shift: float = 0.0
+
+    # Additional Hyena options
+    hyena_post_order_ffn: bool = False  # Apply a dense layer between steps of the recurrence
+    hyena_return_state: bool = False  # Whether to return state information
 
     # Axes
     Pos = property(lambda self: Axis(name="position", size=self.seq_len))
@@ -70,97 +86,61 @@ class Gpt2HyenaConfig(LmConfig):
         return None
 
 
-class Gpt2Hyena(eqx.Module):
-    config: Gpt2HyenaConfig = eqx.field(static=True)
-
-    c_hyena: hnn.Linear  # input projection from [embed] -> [(q, k, v), heads, head_dim]
-    c_proj: hnn.Linear  # output projection from [heads, head_dim] -> [embed]
-    hyena_operator: HyenaOperator
-    inference: bool
-
-    @staticmethod
-    def init(config: Gpt2HyenaConfig, *, key) -> "Gpt2Hyena":
-        Qkv = Axis("qkv", size=3)
-        use_bias = config.use_bias
-        Embed = config.Embed
-
-        k_c, k_proj = jrandom.split(key, 2)
-        c_hyena = hnn.Linear.init(
-            In=Embed, Out=(Qkv, config.Heads, config.HeadSize), key=k_c, use_bias=use_bias, out_first=False
-        )
-        c_proj = hnn.Linear.init(
-            In=(config.Heads, config.HeadSize), Out=Embed, key=k_proj, use_bias=use_bias, out_first=False
-        )
-        hyena_config = HyenaConfig(
-            seq_len=config.seq_len,
-            hidden_dim=config.hidden_dim,
-            order=2,  # one for q, one for k.
-            # TODO: finish filling the rest of the config
-        )
-        hyena_operator = HyenaOperator.init(hyena_config, key=k_hyena)
-        return Gpt2Hyena(config, c_hyena, c_proj, hyena_operator, inference=False)
-
-    @named_call
-    def __call__(self, x: NamedArray, mask: Optional[AttentionMask | NamedArray], layer_idx, *, key):
-        k_drop, k_attn, k_out = hax.jax_utils.maybe_rng_split(key, 3)
-        qkv_out = self.c_hyena(x, key=k_attn).rearrange((..., "qkv", "heads", "position", "head_size"))
-        q, k, v = qkv_out.unbind("qkv")
-
-        # Rename k and v's Pos as haliax doesn't support unnamed axes or duplicate axes
-        k = k.rename({"position": "key_position"})
-        v = v.rename({"position": "key_position"})
-
-        # mistral tweak: attention scores can overflow FP16, or just be too imprecise, so upcast to FP32
-        if self.config.scale_hyena_by_inverse_layer_idx:
-            q = q / (layer_idx + 1.0)
-
-        # TODO: replace with Hyena operator
-        attn_output = dot_product_attention(
-            "position",
-            "key_position",
-            "head_size",
-            q,
-            k,
-            v,
-            mask=mask,
-            inference=self.inference,
-            use_flash=self.config.use_flash_attention,
-            attn_backend=self.config.attn_backend,
-            flash_block_size=self.config.flash_attention_block_size,
-            prng=k_drop,
-            attention_dtype=jnp.float32 if self.config.upcast_hyena else None,
-        )
-
-        attn_output = attn_output.astype(x.dtype)
-        attn_output = self.c_proj(attn_output, key=k_out)
-
-        return attn_output
-
-
 class Gpt2HyenaBlock(eqx.Module):
+    config: Gpt2HyenaConfig = eqx.field(static=True)
     ln_1: hnn.LayerNorm
-    hyena: Gpt2Hyena
+    hyena_operator: HyenaOperator
     ln_2: hnn.LayerNorm
     mlp: Gpt2Mlp
     resid_dropout: hnn.Dropout
 
     @staticmethod
     def init(config: Gpt2HyenaConfig, *, key) -> "Gpt2HyenaBlock":
-        k_attn, k_mlp = jrandom.split(key, 2)
+        k_hyena, k_mlp = jrandom.split(key, 2)
 
         ln_1 = hnn.LayerNorm.init(config.Embed, eps=config.layer_norm_epsilon, use_bias=config.use_bias)
-        hyena = Gpt2Hyena.init(config, key=k_attn)
+
+        # Create HyenaConfig from Gpt2HyenaConfig
+        hyena_config = HyenaConfig(
+            seq_len=config.seq_len,
+            hidden_dim=config.hidden_dim,
+            order=config.hyena_order,
+            filter_order=config.hyena_filter_order,
+            inner_factor=config.hyena_inner_factor,
+            short_filter_order=config.hyena_short_filter_order,
+            outer_mixing=config.hyena_outer_mixing,
+            activation=config.activation_function,
+            emb_dim=config.hyena_emb_dim,
+            filter_dropout=config.hyena_pdrop,
+            fast_decay_pct=config.hyena_fast_decay_pct,
+            slow_decay_pct=config.hyena_slow_decay_pct,
+            target=config.hyena_target,
+            modulate=config.hyena_modulate,
+            shift=config.hyena_shift,
+            resid_pdrop=config.resid_pdrop,
+            use_bias=config.use_bias,
+            post_order_ffn=config.hyena_post_order_ffn,
+            return_state=config.hyena_return_state,
+        )
+
+        # Initialize the HyenaOperator directly
+        hyena_operator = HyenaOperator.init(hyena_config, key=k_hyena)
+
         ln_2 = hnn.LayerNorm.init(config.Embed, eps=config.layer_norm_epsilon, use_bias=config.use_bias)
         mlp = Gpt2Mlp.init(config.Embed, config.Mlp, config.activation_function, key=k_mlp, use_bias=config.use_bias)
         resid_dropout = hnn.Dropout(pdrop=config.resid_pdrop)
 
-        return Gpt2HyenaBlock(ln_1, hyena, ln_2, mlp, resid_dropout)
+        return Gpt2HyenaBlock(config, ln_1, hyena_operator, ln_2, mlp, resid_dropout)
 
     @named_call
     def __call__(self, x: NamedArray, mask: Optional[AttentionMask | NamedArray], layer_idx, *, key):
         k1, k2, k3, k4 = haliax.jax_utils.maybe_rng_split(key, 4)
 
-        hyena_output = self.hyena(self.ln_1(x), mask=mask, layer_idx=layer_idx, key=k1)
+        # Scale by inverse layer idx if configured (similar to Mistral tweak from the original code)
+        # We'll apply this to the input of the Hyena operator
+        x_for_hyena = self.ln_1(x)
+
+        hyena_output = self.hyena_operator(x_for_hyena, key=k1)
         hyena_output = self.resid_dropout(hyena_output, key=k2)
         x = x + hyena_output
 

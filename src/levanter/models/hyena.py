@@ -32,7 +32,6 @@ class HyenaConfig:
     short_filter_order: int = 3  # length of the explicit input convolutional filter
     outer_mixing: bool = False  # whether to use outer mixing
     activation: str = "gelu_new"  # activation function
-    mlp_scale: int = 4  # Scale factor for MLP dimensions
 
     # Filter parameters
     emb_dim: int = 3  # dim of input to MLP, augments with positional encoding
@@ -46,16 +45,9 @@ class HyenaConfig:
     shift: float = 0.0
 
     # General parameters
-    initializer_range: float = 0.02
-    embed_pdrop: float = 0.0
-    resid_pdrop: float = 0.0
-    layer_norm_epsilon: float = 1e-5
-
-    gradient_checkpointing: bool = True
-    gradient_checkpointing_block_size: int = 5
-
-    use_bias: bool = True
-    post_order_ffn: bool = False
+    resid_pdrop: float = 0.0  # Dropout for residual connections
+    use_bias: bool = True  # Whether to use bias in linear layers
+    post_order_ffn: bool = False  # Apply a dense layer between steps of the recurrence
     return_state: bool = False  # Whether to return state information
 
     # Axes
