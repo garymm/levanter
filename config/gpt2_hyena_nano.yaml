@@ -7,7 +7,7 @@ model:
   type: gpt2_hyena
   hidden_dim: 32     # Default: 768
   num_layers: 2      # Default: 12
-  filter_order: 16   # Default: 64
+  hyena_filter_order: 16   # Default: 64
 
 trainer:
   mp: bf16
