@@ -1,4 +1,5 @@
 """The GPT2 architecture, but with Hyena instead of Attention / Transformer."""
+
 import dataclasses
 from dataclasses import dataclass
 from functools import partial
@@ -17,16 +18,9 @@ from haliax.jax_utils import named_call, shaped_rng_split
 from haliax.nn.scan import Stacked
 from haliax.state_dict import ModuleWithStateDictSerialization
 
-from levanter.compat.hf_checkpoints import HFCheckpointConverter, HFCompatConfig, LmWithHfSerializationMixin
-from levanter.models.attention import AttentionBackend, AttentionMask, dot_product_attention
-from levanter.models.lm_model import LmConfig
-from levanter.utils.flop_utils import lm_flops_per_token
-from levanter.utils.logging import silence_transformer_nag
-
-
-silence_transformer_nag()
-from transformers import GPT2Config as HfGpt2Config  # noqa: E402
-from transformers import PretrainedConfig as HfConfig  # noqa: E402
+from levanter.models.attention import AttentionMask, dot_product_attention
+from levanter.models.gpt2 import Gpt2Embeddings, Gpt2Mlp
+from levanter.models.lm_model import LmConfig, LmHeadModel
 
 
 @LmConfig.register_subclass("gpt2_hyena")
@@ -70,46 +64,20 @@ class Gpt2HyenaConfig(LmConfig):
     def model_type(self) -> Type["Gpt2HyenaModel"]:
         return Gpt2HyenaModel
 
-
-
     def flops_per_token(self, vocab_size: int) -> Optional[float]:
         # TODO: implement
+        return None
 
 
-class Gpt2Mlp(eqx.Module):
-    c_fc: hnn.Linear  # projection from Embed to Intermediate (typically 4x Embed)
-    c_proj: hnn.Linear  # projection from Intermediate to Embed
-    act: Callable = eqx.static_field()
-
-    @staticmethod
-    def init(Embed: Axis, Mlp: Axis, activation_fn, *, key, use_bias: bool = True) -> "Gpt2Mlp":
-        k_fc, k_proj = jrandom.split(key, 2)
-        c_fc = hnn.Linear.init(Out=Mlp, In=Embed, key=k_fc, use_bias=use_bias, out_first=False)
-        c_proj = hnn.Linear.init(Out=Embed, In=Mlp, key=k_proj, use_bias=use_bias, out_first=False)
-        if isinstance(activation_fn, str):
-            activation_fn = ACT2FN[activation_fn]
-        act = activation_fn  # type: ignore
-
-        return Gpt2Mlp(c_fc, c_proj, act)
-
-    @named_call
-    def __call__(self, x: NamedArray, *, key=None):
-        k1, k2 = haliax.jax_utils.maybe_rng_split(key, 2)
-        x = self.c_fc(x, key=k1)
-        x = self.act(x)
-        x = self.c_proj(x, key=k2)
-        return x
-
-
-class Gpt2Attention(eqx.Module):
-    config: Gpt2Config = eqx.static_field()
+class Gpt2Hyena(eqx.Module):
+    config: Gpt2HyenaConfig = eqx.field(static=True)
 
     c_attn: hnn.Linear  # input projection from [embed] -> [(q, k, v), heads, head_dim]
     c_proj: hnn.Linear  # output projection from [heads, head_dim] -> [embed]
     inference: bool
 
     @staticmethod
-    def init(config: Gpt2Config, *, key) -> "Gpt2Attention":
+    def init(config: Gpt2HyenaConfig, *, key) -> "Gpt2Hyena":
         Qkv = Axis("qkv", size=3)
         use_bias = config.use_bias
         Embed = config.Embed
@@ -122,7 +90,7 @@ class Gpt2Attention(eqx.Module):
             In=(config.Heads, config.HeadSize), Out=Embed, key=k_proj, use_bias=use_bias, out_first=False
         )
 
-        return Gpt2Attention(config, c_attn, c_proj, inference=False)
+        return Gpt2Hyena(config, c_attn, c_proj, inference=False)
 
     @named_call
     def __call__(self, x: NamedArray, mask: Optional[AttentionMask | NamedArray], layer_idx, *, key):
@@ -160,32 +128,32 @@ class Gpt2Attention(eqx.Module):
         return attn_output
 
 
-class Gpt2Block(eqx.Module):
+class Gpt2HyenaBlock(eqx.Module):
     ln_1: hnn.LayerNorm
-    attn: Gpt2Attention
+    hyena: Gpt2Hyena
     ln_2: hnn.LayerNorm
     mlp: Gpt2Mlp
     resid_dropout: hnn.Dropout
 
     @staticmethod
-    def init(config: Gpt2Config, *, key) -> "Gpt2Block":
+    def init(config: Gpt2HyenaConfig, *, key) -> "Gpt2HyenaBlock":
         k_attn, k_mlp = jrandom.split(key, 2)
 
         ln_1 = hnn.LayerNorm.init(config.Embed, eps=config.layer_norm_epsilon, use_bias=config.use_bias)
-        attn = Gpt2Attention.init(config, key=k_attn)
+        attn = Gpt2Hyena.init(config, key=k_attn)
         ln_2 = hnn.LayerNorm.init(config.Embed, eps=config.layer_norm_epsilon, use_bias=config.use_bias)
         mlp = Gpt2Mlp.init(config.Embed, config.Mlp, config.activation_function, key=k_mlp, use_bias=config.use_bias)
         resid_dropout = hnn.Dropout(pdrop=config.resid_pdrop)
 
-        return Gpt2Block(ln_1, attn, ln_2, mlp, resid_dropout)
+        return Gpt2HyenaBlock(ln_1, attn, ln_2, mlp, resid_dropout)
 
     @named_call
     def __call__(self, x: NamedArray, mask: Optional[AttentionMask | NamedArray], layer_idx, *, key):
         k1, k2, k3, k4 = haliax.jax_utils.maybe_rng_split(key, 4)
 
-        attn_output = self.attn(self.ln_1(x), mask=mask, layer_idx=layer_idx, key=k1)
-        attn_output = self.resid_dropout(attn_output, key=k2)
-        x = x + attn_output
+        hyena_output = self.hyena(self.ln_1(x), mask=mask, layer_idx=layer_idx, key=k1)
+        hyena_output = self.resid_dropout(hyena_output, key=k2)
+        x = x + hyena_output
 
         ff_output = self.mlp(self.ln_2(x), key=k3)
         ff_output = self.resid_dropout(ff_output, key=k4)
@@ -194,21 +162,21 @@ class Gpt2Block(eqx.Module):
         return x
 
 
-class Gpt2Transformer(ModuleWithStateDictSerialization):
-    config: Gpt2HyenaConfig = eqx.static_field()
-    blocks: Stacked[Gpt2Block]
+class Gpt2HyenaBackbone(ModuleWithStateDictSerialization):
+    config: Gpt2HyenaConfig = eqx.field(static=True)
+    blocks: Stacked[Gpt2HyenaBlock]
     ln_f: hnn.LayerNorm
 
     @staticmethod
     def init(config: Gpt2HyenaConfig, *, key):
         # vectorize the blocks
-        blocks = Stacked.init(config.Layers, Gpt2Block, gradient_checkpointing=config.gradient_checkpointing)(
+        blocks = Stacked.init(config.Layers, Gpt2HyenaBlock, gradient_checkpointing=config.gradient_checkpointing)(
             config,
             key=shaped_rng_split(key, config.num_layers),
         )
         ln_f = hnn.LayerNorm.init(config.Embed, eps=config.layer_norm_epsilon, use_bias=config.use_bias)
 
-        return Gpt2Transformer(config, blocks, ln_f)
+        return Gpt2HyenaBackbone(config, blocks, ln_f)
 
     @named_call
     def __call__(self, x: NamedArray, attn_mask: Optional[AttentionMask | NamedArray], *, key=None) -> NamedArray:
@@ -222,51 +190,8 @@ class Gpt2Transformer(ModuleWithStateDictSerialization):
         return {"blocks": "h"}
 
 
-class Gpt2Embeddings(ModuleWithStateDictSerialization, eqx.Module):
-    Vocab: Axis = eqx.static_field()
-    config: Gpt2Config = eqx.static_field()
-
-    token_embeddings: hnn.Embedding
-    position_embeddings: hnn.Embedding
-    dropout: hnn.Dropout
-
-    @staticmethod
-    def init(Vocab: Axis, config: Gpt2Config, *, key) -> "Gpt2Embeddings":
-        k_wte, k_wpe, k_out = jrandom.split(key, 3)
-
-        token_embeddings = hnn.Embedding.init(
-            Vocab, config.Embed, key=k_wte, initializer_range=config.initializer_range
-        )
-        position_embeddings = hnn.Embedding.init(
-            config.Pos, config.Embed, key=k_wpe, initializer_range=config.initializer_range / 2
-        )
-        dropout = hnn.Dropout(pdrop=config.embed_pdrop)
-
-        return Gpt2Embeddings(Vocab, config, token_embeddings, position_embeddings, dropout)
-
-    @named_call
-    def embed(self, input_ids, *, key):
-        input_embeds = self.token_embeddings(input_ids)
-        input_Pos = input_ids.resolve_axis("position")
-        position_embeds = self.position_embeddings.embed(hax.arange(input_Pos))
-        x = input_embeds + position_embeds
-        x = self.dropout(x, key=key)
-
-        return x
-
-    def unembed(self, x: NamedArray):
-        return hax.dot(x, self.token_embeddings.weight, axis="embed")
-
-    def _state_dict_key_map(self) -> Dict[str, Optional[str]]:
-        return {"token_embeddings": "wte", "position_embeddings": "wpe"}
-
-    def resize_embeddings(self, new_size: int, key: Optional[PRNGKeyArray] = None):
-        new_token_embeddings = self.token_embeddings.resize_embeddings(new_size, key=key)
-        return dataclasses.replace(self, Vocab=self.Vocab.resize(new_size), token_embeddings=new_token_embeddings)
-
-
 class Gpt2HyenaModel(LmHeadModel[Gpt2HyenaConfig]):
-    backbone: Gpt2Transformer
+    backbone: Gpt2HyenaBackbone
     embeddings: Gpt2Embeddings
 
     @property
@@ -282,10 +207,15 @@ class Gpt2HyenaModel(LmHeadModel[Gpt2HyenaConfig]):
         return self.config.Pos
 
     @classmethod
-    def init(cls, Vocab: Axis, config: Gpt2Config, *, key) -> "Gpt2HyenaModel":
+    def init(cls, Vocab: Axis, config: Gpt2HyenaConfig, *, key) -> "Gpt2HyenaModel":
         k_t, k_embeddings = jrandom.split(key, 2)
-        backbone = Gpt2Transformer.init(config, key=k_t)
-        embeddings = Gpt2Embeddings.init(Vocab, config, key=k_embeddings)
+        backbone = Gpt2HyenaBackbone.init(config, key=k_t)
+        embeddings = Gpt2Embeddings.init(
+            Vocab,
+            # Our config type has everything it needs, but is not a subclass of Gpt2Config
+            config,  # type: ignore
+            key=k_embeddings,
+        )
 
         return Gpt2HyenaModel(backbone, embeddings)
 
