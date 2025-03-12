@@ -19,6 +19,7 @@ from haliax.nn.scan import Stacked
 from haliax.state_dict import ModuleWithStateDictSerialization
 
 from levanter.models.attention import AttentionMask, dot_product_attention
+from levanter.models.hyena import HyenaOperator, HyenaConfig
 from levanter.models.gpt2 import Gpt2Embeddings, Gpt2Mlp
 from levanter.models.lm_model import LmConfig, LmHeadModel
 
@@ -61,7 +62,7 @@ class Gpt2HyenaConfig(LmConfig):
     HeadSize = property(lambda self: Axis(name="head_size", size=self.hidden_dim // self.num_heads))
 
     @property
-    def model_type(self) -> Type["Gpt2HyenaModel"]:
+    def model_type(cls) -> Type["Gpt2HyenaModel"]:
         return Gpt2HyenaModel
 
     def flops_per_token(self, vocab_size: int) -> Optional[float]:
@@ -72,8 +73,9 @@ class Gpt2HyenaConfig(LmConfig):
 class Gpt2Hyena(eqx.Module):
     config: Gpt2HyenaConfig = eqx.field(static=True)
 
-    c_attn: hnn.Linear  # input projection from [embed] -> [(q, k, v), heads, head_dim]
+    c_hyena: hnn.Linear  # input projection from [embed] -> [(q, k, v), heads, head_dim]
     c_proj: hnn.Linear  # output projection from [heads, head_dim] -> [embed]
+    hyena_operator: HyenaOperator
     inference: bool
 
     @staticmethod
@@ -83,19 +85,25 @@ class Gpt2Hyena(eqx.Module):
         Embed = config.Embed
 
         k_c, k_proj = jrandom.split(key, 2)
-        c_attn = hnn.Linear.init(
+        c_hyena = hnn.Linear.init(
             In=Embed, Out=(Qkv, config.Heads, config.HeadSize), key=k_c, use_bias=use_bias, out_first=False
         )
         c_proj = hnn.Linear.init(
             In=(config.Heads, config.HeadSize), Out=Embed, key=k_proj, use_bias=use_bias, out_first=False
         )
-
-        return Gpt2Hyena(config, c_attn, c_proj, inference=False)
+        hyena_config = HyenaConfig(
+            seq_len=config.seq_len,
+            hidden_dim=config.hidden_dim,
+            order=2,  # one for q, one for k.
+            # TODO: finish filling the rest of the config
+        )
+        hyena_operator = HyenaOperator.init(hyena_config, key=k_hyena)
+        return Gpt2Hyena(config, c_hyena, c_proj, hyena_operator, inference=False)
 
     @named_call
     def __call__(self, x: NamedArray, mask: Optional[AttentionMask | NamedArray], layer_idx, *, key):
         k_drop, k_attn, k_out = hax.jax_utils.maybe_rng_split(key, 3)
-        qkv_out = self.c_attn(x, key=k_attn).rearrange((..., "qkv", "heads", "position", "head_size"))
+        qkv_out = self.c_hyena(x, key=k_attn).rearrange((..., "qkv", "heads", "position", "head_size"))
         q, k, v = qkv_out.unbind("qkv")
 
         # Rename k and v's Pos as haliax doesn't support unnamed axes or duplicate axes
@@ -106,6 +114,7 @@ class Gpt2Hyena(eqx.Module):
         if self.config.scale_hyena_by_inverse_layer_idx:
             q = q / (layer_idx + 1.0)
 
+        # TODO: replace with Hyena operator
         attn_output = dot_product_attention(
             "position",
             "key_position",
@@ -140,12 +149,12 @@ class Gpt2HyenaBlock(eqx.Module):
         k_attn, k_mlp = jrandom.split(key, 2)
 
         ln_1 = hnn.LayerNorm.init(config.Embed, eps=config.layer_norm_epsilon, use_bias=config.use_bias)
-        attn = Gpt2Hyena.init(config, key=k_attn)
+        hyena = Gpt2Hyena.init(config, key=k_attn)
         ln_2 = hnn.LayerNorm.init(config.Embed, eps=config.layer_norm_epsilon, use_bias=config.use_bias)
         mlp = Gpt2Mlp.init(config.Embed, config.Mlp, config.activation_function, key=k_mlp, use_bias=config.use_bias)
         resid_dropout = hnn.Dropout(pdrop=config.resid_pdrop)
 
-        return Gpt2HyenaBlock(ln_1, attn, ln_2, mlp, resid_dropout)
+        return Gpt2HyenaBlock(ln_1, hyena, ln_2, mlp, resid_dropout)
 
     @named_call
     def __call__(self, x: NamedArray, mask: Optional[AttentionMask | NamedArray], layer_idx, *, key):
