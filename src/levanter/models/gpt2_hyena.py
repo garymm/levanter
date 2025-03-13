@@ -110,7 +110,7 @@ class Gpt2HyenaBlock(eqx.Module):
             short_filter_order=config.hyena_short_filter_order,
             outer_mixing=config.hyena_outer_mixing,
             activation=config.activation_function,
-            emb_dim=config.hyena_emb_dim,
+            filter_emb_dim=config.hyena_emb_dim,
             filter_dropout=config.hyena_pdrop,
             fast_decay_pct=config.hyena_fast_decay_pct,
             slow_decay_pct=config.hyena_slow_decay_pct,

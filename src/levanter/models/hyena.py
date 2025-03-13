@@ -3,11 +3,16 @@
 Paper: [Hyena Hierarchy: Towards Larger Convolutional Language Models](https://arxiv.org/abs/2302.10866)
 Official implementation in PyTorch:
 https://github.com/HazyResearch/safari/blob/541902aca88cb11af4d816ac762f3303e4ff8eea/src/models/sequence/hyena.py
+
+Current diffences from the official impl:
+- We don't support inner_factor.
+- We don't support post_order_ffn.
+- We don't support num_heads (the PyTorch impl's support for multiple heads seems incomplete, or at least
+  I don't understand it).
 """
 
 from dataclasses import dataclass
-from functools import partial
-from typing import Callable
+import typing
 
 import equinox as eqx
 import haliax
@@ -29,16 +34,15 @@ class HyenaConfig:
 
     # hyena specific parameters
     order: int = 2  # depth of the Hyena recurrence
-    filter_order: int = 64  # width of the FFN parametrizing the implicit filter
-    inner_factor: int = 1  # inner dimension multiplier
+    filter_order: int = 16  # width of the FFN parametrizing the implicit filter
     short_filter_order: int = 3  # length of the explicit input convolutional filter
     outer_mixing: bool = False  # whether to use outer mixing
     activation: ActivationFunctionName = ActivationFunctionName.GELU_NEW
     num_blocks: int = 1  # number of blocks to split the sequence into
-    num_heads: int = 1  # number of heads
+    num_hidden_layers_filter_mlp: int = 2  # number of inner linear layers inside filter MLP
 
     # Filter parameters
-    emb_dim: int = 3  # dim of input to MLP, augments with positional encoding
+    filter_emb_dim: int = 3  # dim of input to MLP, augments with positional encoding
     filter_dropout: float = 0.0  # dropout probability for the filter
 
     # Modulation parameters
@@ -58,14 +62,13 @@ class HyenaConfig:
     Embed = property(lambda self: Axis(name="embed", size=self.hidden_dim))
     Block = property(lambda self: Axis(name="blocks", size=self.num_blocks))
     PosPerBlock = property(lambda self: Axis(name="pos_per_block", size=self.seq_len // self.num_blocks))
-    Head = property(lambda self: Axis(name="head", size=self.num_heads))
-    EmbedPerHead = property(lambda self: Axis(name="embed_per_head", size=self.hidden_dim // self.num_heads))
+    FilterOrder = property(lambda self: Axis(name="filter_order", size=self.filter_order))
+    FilterEmbed = property(lambda self: Axis(name="filter_embed", size=self.filter_emb_dim))
+    EmbedAllOrders = property(lambda self: Axis(name="embed_all_orders", size=(self.order + 1) * self.hidden_dim))
 
     def __post_init__(self):
         if self.seq_len % self.num_blocks:
             raise ValueError(f"seq_len {self.seq_len} must be divisible by num_blocks {self.num_blocks}")
-        if self.hidden_dim % self.num_heads:
-            raise ValueError(f"hidden_dim {self.hidden_dim} must be divisible by num_heads {self.num_heads}")
 
 
 class ImplicitFilterMLP(eqx.Module):
@@ -77,15 +80,11 @@ class ImplicitFilterMLP(eqx.Module):
     sin_activations: list
 
     @staticmethod
-    def init(emb_dim: int, filter_order: int, embed_dim: int, use_bias: bool, num_hidden_layers: int = 2, *, key):
+    def init(FilterEmbed: Axis, Order: Axis, Out: Axis, use_bias: bool, num_hidden_layers: int = 2, *, key):
         keys = jrandom.split(key, num_hidden_layers + 2)
 
-        # Define unique axes for each layer
-        EmbDimAxis = Axis("emb_dim", emb_dim)
-        FilterOrderAxis = Axis("filter_order", filter_order)
-
         # Input projection
-        input_proj = hnn.Linear.init(In=EmbDimAxis, Out=FilterOrderAxis, key=keys[0], use_bias=use_bias)
+        input_proj = hnn.Linear.init(In=FilterEmbed, Out=Order, key=keys[0], use_bias=use_bias)
 
         # Hidden projections
         hidden_projs = []
@@ -93,38 +92,32 @@ class ImplicitFilterMLP(eqx.Module):
 
         for i in range(num_hidden_layers):
             # Create a unique filter order axis for each hidden layer to avoid naming collisions
-            InFilterAxis = Axis(f"filter_in_{i}", filter_order)
-            OutFilterAxis = Axis(f"filter_out_{i}", filter_order)
+            InFilterAxis = Order.alias(f"filter_in_{i}")
+            OutFilterAxis = Order.alias(f"filter_out_{i}")
 
             hidden_projs.append(
                 hnn.Linear.init(In=InFilterAxis, Out=OutFilterAxis, key=keys[i + 1], use_bias=use_bias)
             )
-            sin_activations.append(Sin.init(filter_order, w=1))
+            sin_activations.append(Sin.init(Order, w=1))
 
         # Add an activation for the input projection
-        sin_activations.insert(0, Sin.init(filter_order, w=1))
+        sin_activations.insert(0, Sin.init(Order, w=1))
 
         # Output projection - use a different axis name to avoid embedding axis collision
-        LastFilterAxis = Axis(f"filter_out_{num_hidden_layers-1}", filter_order)
-        EmbedOutAxis = Axis("embed_out", embed_dim)
-        output_proj = hnn.Linear.init(In=LastFilterAxis, Out=EmbedOutAxis, key=keys[-1], use_bias=False)
+        LastFilterAxis = Order.alias(f"filter_out_{num_hidden_layers-1}")
+        output_proj = hnn.Linear.init(In=LastFilterAxis, Out=Out, key=keys[-1], use_bias=False)
 
         return ImplicitFilterMLP(input_proj, hidden_projs, output_proj, sin_activations)
 
     def __call__(self, x, *, key=None):
-        # Apply input projection
         x = self.input_proj(x)
         x = self.sin_activations[0](x)
 
-        # Apply hidden layers
-        for i, (proj, act) in enumerate(zip(self.hidden_projs, self.sin_activations[1:])):
+        for proj, act in zip(self.hidden_projs, self.sin_activations[1:]):
             x = proj(x)
             x = act(x)
 
-        # Apply output projection
-        x = self.output_proj(x)
-
-        return x
+        return self.output_proj(x)
 
 
 class PositionalEmbedding(eqx.Module):
@@ -269,15 +262,14 @@ class ExponentialModulation(eqx.Module):
 class Sin(eqx.Module):
     """Sinusoidal activation function with trainable frequency."""
 
-    freq: jnp.ndarray
+    freq: hax.NamedArray
 
     @staticmethod
-    def init(dim: int, w: float = 10, train_freq: bool = True, *, key=None):
-        freq = w * jnp.ones((1, dim))
-        return Sin(freq)
+    def init(Order: Axis, w: float = 10, *, key=None):
+        return Sin(w * hax.ones((Order,)))
 
-    def __call__(self, x):
-        return jnp.sin(self.freq * x)
+    def __call__(self, x: hax.NamedArray) -> hax.NamedArray:
+        return hax.sin(self.freq * x)
 
 
 def fft_conv(u, k, bias=None):
@@ -316,15 +308,15 @@ class HyenaFilter(eqx.Module):
         keys = jrandom.split(key, 4)
 
         # Initialize positional embedding
-        pos_emb = PositionalEmbedding.init(config.Pos, config.emb_dim, key=keys[0])
+        pos_emb = PositionalEmbedding.init(config.Pos, config.filter_emb_dim, key=keys[0])
 
         # Initialize implicit filter MLP
         implicit_filter = ImplicitFilterMLP.init(
-            emb_dim=config.emb_dim,
-            filter_order=config.filter_order,
-            embed_dim=config.hidden_dim,
+            FilterEmbed=config.FilterEmbed,
+            Order=config.FilterOrder,
+            Out=config.Embed,
             use_bias=config.use_bias,
-            num_hidden_layers=2,
+            num_hidden_layers=config.num_hidden_layers_filter_mlp,
             key=keys[1],
         )
 
@@ -413,11 +405,9 @@ class HyenaOperator(eqx.Module):
     def init(config: HyenaConfig, *, key):
         keys = jrandom.split(key, 5)
 
-        # Input projection: hidden_size -> (order + 1) * hidden_size
-        EmbedAllOrders = Axis("embed_all_orders", (config.order + 1) * config.hidden_dim)
         in_proj = hnn.Linear.init(
             In=config.Embed,
-            Out=EmbedAllOrders,
+            Out=config.EmbedAllOrders,
             key=keys[0],
             use_bias=config.use_bias,
         )
@@ -425,15 +415,16 @@ class HyenaOperator(eqx.Module):
         # Output projection: hidden_size -> hidden_size
         # Create a new axis with the same dimensions to avoid naming collision
         # We do not support inner_factor from the PyTorch impl.
-        OutputEmbed = Axis("output_embed", config.Embed.size)
-        out_proj = hnn.Linear.init(In=config.Embed, Out=OutputEmbed, key=keys[1], use_bias=config.use_bias)
+        out_proj = hnn.Linear.init(
+            In=config.Embed, Out=config.Embed.alias("output_embed"), key=keys[1], use_bias=config.use_bias
+        )
 
         short_filter = hnn.Conv.init(
             Spatial=config.Pos,
-            In=EmbedAllOrders,
-            Out=Axis("out_channels", EmbedAllOrders.size),
+            In=config.EmbedAllOrders,
+            Out=config.EmbedAllOrders.alias("out_channels"),
             kernel_size=config.short_filter_order,
-            groups=EmbedAllOrders.size,
+            groups=config.EmbedAllOrders.size,
             padding=config.short_filter_order - 1,
             key=keys[2],
         )
@@ -457,46 +448,39 @@ class HyenaOperator(eqx.Module):
 
         assert u.resolve_axis("position") == self.config.Pos
         Pos = self.config.Pos
-        Embed = self.config.Embed
         Block = self.config.Block
         PosPerBlock = self.config.PosPerBlock
-        Head = self.config.Head
-        EmbedPerHead = self.config.EmbedPerHead
+        EmbedAllOrders = self.config.EmbedAllOrders
 
         # Input projection from [Embed] to [(order+1) * Embed]
         u = self.in_proj(u, key=key_in_proj)
 
-        # For the short filter, we need to reshape to a format where channels come first
-        EmbedAllOrders = self.in_proj.Out
-        u = u.rearrange((EmbedAllOrders, Pos))
         # trying to keep the variable names from the official impl.
         # I think uc stands for "u convolved".
-        uc = self.short_filter(u)
+        uc = self.short_filter(u).rename({"out_channels": EmbedAllOrders})
 
         # Now we need to reshape to match the PyTorch implementation's:
         # 'b (ho v) (z l) -> b ho v z l'
         # we don't have b (we vmap over it).
+        # we don't have ho (hard-coding num_heads to 1)
 
-        uc = hax.unflatten_axis(uc, Embed, (Head, EmbedPerHead))
         uc = hax.unflatten_axis(uc, Pos, (Block, PosPerBlock))
 
         # Extract the components - we'll unbind on the Order axis
-        components = hax.unbind(uc, EmbedPerHead)
+        components = hax.unbind(uc, EmbedAllOrders)
         v = components[-1]  # Last component is v
         x = components[:-1]  # All others are x components
         assert len(x) == self.config.order
 
         # Long-range filtering with recurrence
-        # TODO: not done. Go through torch impl and compare.
-        for o, x_i in enumerate(reversed(x[1:])):
-            # Outer product of EmbedPerHead with EmbedPerHead
+        for x_i in reversed(x[1:]):
+            # Outer product of EmbedAllOrders with EmbedAllOrders
             if self.config.outer_mixing:
-                EmbedPerHeadPrime = Axis("EmbedPerHeadPrime", EmbedPerHead.size)
-                assert isinstance(v, hax.NamedArray)  # make type-checker happy
-                v_for_outer = hax.rename(v, {EmbedPerHead: EmbedPerHeadPrime})
-                outer_product = v_for_outer.broadcast_axis(EmbedPerHeadPrime) * x_i
+                EmbedAllOrdersPrime = EmbedAllOrders.alias("embed_all_orders_prime")
+                v_for_outer = hax.rename(typing.cast(hax.NamedArray, v), {EmbedAllOrders: EmbedAllOrdersPrime})
+                outer_product = v_for_outer.broadcast_axis(EmbedAllOrdersPrime) * x_i
                 v = self.dropout(outer_product, key=key_dropout)
-                v = hax.sum(v, EmbedPerHeadPrime)
+                v = hax.sum(v, EmbedAllOrdersPrime)
             else:
                 v = self.dropout(v * x_i, key=key_dropout)
 
@@ -506,15 +490,13 @@ class HyenaOperator(eqx.Module):
 
             # Not currently supporting the post_order_ffn from the PyTorch impl.
 
-        # First x is special - element-wise product with the filtered result
         v = v * x[0]
-        assert isinstance(v, hax.NamedArray)  # make type-checker happy
-        # merge the head and block axes
+        # flatten the block axis
         v = hax.rearrange(
-            v,
+            typing.cast(hax.NamedArray, v),
             (
-                f"{Head.name} {EmbedPerHead.name} {Block.name} {PosPerBlock.name} ->"
-                f"({Embed.name}: {Head.name} {EmbedPerHead.name}) ({Pos.name}: {Block.name} {PosPerBlock.name})"
+                f"{EmbedAllOrders.name} {Block.name} {PosPerBlock.name} ->"
+                f"{EmbedAllOrders.name} ({Pos.name}: {Block.name} {PosPerBlock.name})"
             ),
         )
         y = self.activation(v)
