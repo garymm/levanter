@@ -32,6 +32,8 @@ class HyenaConfig:
     short_filter_order: int = 3  # length of the explicit input convolutional filter
     outer_mixing: bool = False  # whether to use outer mixing
     activation: str = "gelu_new"  # activation function
+    num_blocks: int = 1  # number of blocks to split the sequence into
+    num_heads: int = 1  # number of heads
 
     # Filter parameters
     emb_dim: int = 3  # dim of input to MLP, augments with positional encoding
@@ -47,13 +49,22 @@ class HyenaConfig:
     # General parameters
     resid_pdrop: float = 0.0  # Dropout for residual connections
     use_bias: bool = True  # Whether to use bias in linear layers
-    post_order_ffn: bool = False  # Apply a dense layer between steps of the recurrence
     return_state: bool = False  # Whether to return state information
 
     # Axes
     Pos = property(lambda self: Axis(name="position", size=self.seq_len))
     KeyPos = property(lambda self: self.Pos.alias("key_position"))
     Embed = property(lambda self: Axis(name="embed", size=self.hidden_dim))
+    Block = property(lambda self: Axis(name="blocks", size=self.num_blocks))
+    PosPerBlock = property(lambda self: Axis(name="pos_per_block", size=self.seq_len // self.num_blocks))
+    Head = property(lambda self: Axis(name="head", size=self.num_heads))
+    EmbedPerHead = property(lambda self: Axis(name="embed_per_head", size=self.hidden_dim // self.num_heads))
+
+    def __post_init__(self):
+        if self.seq_len % self.num_blocks:
+            raise ValueError(f"seq_len {self.seq_len} must be divisible by num_blocks {self.num_blocks}")
+        if self.hidden_dim % self.num_heads:
+            raise ValueError(f"hidden_dim {self.hidden_dim} must be divisible by num_heads {self.num_heads}")
 
 
 class ImplicitFilterMLP(eqx.Module):
@@ -118,42 +129,78 @@ class ImplicitFilterMLP(eqx.Module):
 class PositionalEmbedding(eqx.Module):
     """Complex exponential positional embeddings for Hyena filters."""
 
-    z: hax.NamedArray  # [1, seq_len, emb_dim]
-    t: hax.NamedArray  # [1, seq_len, 1]
+    z: hax.NamedArray  # [seq_len, emb_dim]
+    t: hax.NamedArray  # [seq_len, 1]
+    Pos: Axis = eqx.field(static=True)
+    EmDim: Axis = eqx.field(static=True)
+    TimeDim: Axis = eqx.field(static=True)
 
     @staticmethod
     def init(Pos: Axis, emb_dim: int, *, key=None):
-        # The time embedding fed to the filters is normalized so that t_f = 1
+        """Initialize positional embeddings for Hyena filters.
+
+        Args:
+            Pos: Position axis with size equal to seq_len
+            emb_dim: Dimension of positional embedding
+            key: Optional random key (not used)
+        """
         seq_len = Pos.size
 
-        # Create plain JAX arrays for the positional embeddings
-        # The shape is [1, seq_len, 1] for broadcasting
-        t = jnp.zeros((1, seq_len, 1), dtype=jnp.float32)
-        t = t + jnp.linspace(0, 1, seq_len).reshape(1, seq_len, 1)
+        # Ensure emb_dim is valid
+        if emb_dim <= 1:
+            raise ValueError("emb_dim must be greater than 1")
 
-        if emb_dim > 1:
-            bands = (emb_dim - 1) // 2
+        # Calculate number of frequency bands
+        bands = (emb_dim - 1) // 2
 
-        # To compute the right embeddings we use the "proper" linspace
-        t_rescaled = jnp.zeros((1, seq_len, 1), dtype=jnp.float32)
-        t_rescaled = t_rescaled + jnp.linspace(0, seq_len - 1, seq_len).reshape(1, seq_len, 1)
+        # Create time embedding normalized to [0, 1]
+        t_array = jnp.linspace(0, 1, seq_len).reshape(seq_len, 1)
 
+        # Create rescaled time for frequencies
+        t_rescaled = jnp.linspace(0, seq_len - 1, seq_len).reshape(seq_len, 1)
+
+        # Calculate frequencies
         w = 2 * jnp.pi * t_rescaled / seq_len
 
-        f = jnp.linspace(1e-4, bands - 1, bands).reshape(1, 1, bands)
+        # Create frequency bands
+        f = jnp.linspace(1e-4, bands - 1, bands).reshape(1, bands)
         z_complex = jnp.exp(-1j * f * w)
-        z = jnp.concatenate([t, jnp.real(z_complex), jnp.imag(z_complex)], axis=-1)
 
-        # Convert plain JAX arrays to NamedArrays
-        Batch = Axis("batch", 1)
-        EmDim = Axis("embedding_dim", z.shape[-1])
-        z_named = hax.named(z, (Batch, Pos, EmDim))
-        t_named = hax.named(t, (Batch, Pos, Axis("time_dim", 1)))
+        # Concatenate time and complex components
+        z_array = jnp.concatenate([t_array, jnp.real(z_complex), jnp.imag(z_complex)], axis=-1)
 
-        return PositionalEmbedding(z_named, t_named)
+        # Create Haliax axes
+        EmDim = Axis("embedding_dim", z_array.shape[-1])
+        TimeDim = Axis("time_dim", 1)
+
+        # Create named arrays
+        z_named = hax.named(z_array, (Pos, EmDim))
+        t_named = hax.named(t_array, (Pos, TimeDim))
+
+        return PositionalEmbedding(z_named, t_named, Pos, EmDim, TimeDim)
 
     def __call__(self, L):
-        return self.z[:, :L], self.t[:, :L]
+        """Get positional embeddings for the first L positions.
+
+        Args:
+            L: Length to get embeddings for
+
+        Returns:
+            Tuple of (z, t) embeddings limited to length L
+        """
+        if L > self.Pos.size:
+            raise ValueError(f"Requested length {L} exceeds maximum length {self.Pos.size}")
+
+        # Create a subset axis of length L
+        L_pos = Axis("position", L)
+
+        indices = hax.arange(L_pos)
+
+        # Map from L_pos to Pos for indexing
+        z_subset = self.z[{self.Pos.name: indices}]
+        t_subset = self.t[{self.Pos.name: indices}]
+
+        return z_subset, t_subset
 
 
 class ExponentialModulation(eqx.Module):
@@ -162,6 +209,7 @@ class ExponentialModulation(eqx.Module):
     deltas: hax.NamedArray
     modulate: bool
     shift: float
+    Embed: Axis = eqx.field(static=True)
 
     @staticmethod
     def init(
@@ -174,16 +222,46 @@ class ExponentialModulation(eqx.Module):
         *,
         key=None,
     ):
+        """Initialize exponential modulation for Hyena filter.
+
+        Args:
+            Embed: Embedding dimension axis
+            fast_decay_pct: Fast decay percentage
+            slow_decay_pct: Slow decay percentage
+            target: Target value for decay
+            modulate: Whether to apply modulation
+            shift: Shift value for modulation
+            key: Random key (not used)
+        """
         max_decay = jnp.log(target) / fast_decay_pct
         min_decay = jnp.log(target) / slow_decay_pct
-        deltas = jnp.linspace(min_decay, max_decay, Embed.size).reshape(1, 1, Embed.size)
 
-        return ExponentialModulation(deltas, modulate, shift)
+        # Create deltas array directly as a named array
+        decays = jnp.linspace(min_decay, max_decay, Embed.size)
+        deltas = hax.named(decays, (Embed,))
+
+        return ExponentialModulation(deltas, modulate, shift, Embed)
 
     def __call__(self, t, x):
+        """Apply exponential modulation to input.
+
+        Args:
+            t: Time values
+            x: Input tensor to modulate
+
+        Returns:
+            Modulated tensor
+        """
         if self.modulate:
-            decay = jnp.exp(-t * jnp.abs(self.deltas))
+            # Apply modulation using Haliax operations
+            deltas_abs = hax.abs(self.deltas)
+
+            # t should be a NamedArray with a time dimension
+            # We need to broadcast it against deltas_abs
+            decay = hax.exp(-t * deltas_abs.broadcast_to(x.axes))
+
             x = x * (decay + self.shift)
+
         return x
 
 
@@ -276,12 +354,30 @@ class HyenaFilter(eqx.Module):
         h = self.modulation(t, h)
 
         if self.normalized:
-            h = h / jnp.norm(h, axis=-2, ord=1, keepdims=True)
+            # Implement L1 norm manually since jnp.norm isn't recognized
+            # Compute sum of absolute values along the sequence dimension
+            h_abs = hax.abs(h)
+            # Use where parameter instead of keepdims
+            norm_values = hax.sum(h_abs, axis=h.axes[1], where=None)
+            # Reshape and broadcast the norm values
+            h = h / norm_values.broadcast_axis(h.axes[1])
 
         return h
 
     @named_call
     def __call__(self, x, L, k=None, bias=None, *, key=None):
+        """Apply the hyena filter.
+
+        Args:
+            x: Input tensor with shape (batch, seq_len, channels)
+            L: Sequence length
+            k: Optional filter to use (if None, computed using self.filter)
+            bias: Optional bias to use (if None, uses self.bias)
+            key: Optional PRNG key for dropout
+
+        Returns:
+            Filtered tensor with same shape as input
+        """
         if k is None:
             k = self.filter(L, key=key)
 
@@ -290,17 +386,13 @@ class HyenaFilter(eqx.Module):
 
         bias = bias if self.use_bias else jnp.zeros_like(bias)
 
-        # Reshape for FFT convolution
-        batch_size, seq_len, channels = x.shape
-        x_reshaped = x.reshape(batch_size, seq_len, channels)
-        k_reshaped = k.reshape(1, seq_len, channels)
+        # Apply FFT convolution with support for NamedArrays
+        y = fft_conv(x, k, bias)
 
-        # Apply FFT convolution
-        y = fft_conv(x_reshaped, k_reshaped, bias)
-
-        # Apply dropout
-        if key is not None:
-            y = self.dropout(y, key=key)
+        # Apply dropout if key is provided
+        if key is not None and self.dropout.pdrop > 0:
+            dropout_key = haliax.jax_utils.maybe_rng_split(key, 1)[0]
+            y = self.dropout(y, key=dropout_key)
 
         return y
 
@@ -308,13 +400,13 @@ class HyenaFilter(eqx.Module):
 class HyenaOperator(eqx.Module):
     """Hyena operator - the core building block of the Hyena architecture."""
 
-    config: HyenaConfig = eqx.static_field()
+    config: HyenaConfig = eqx.field(static=True)
     in_proj: hnn.Linear
     out_proj: hnn.Linear
     short_filter: hnn.Conv
     filter_fn: HyenaFilter
     dropout: hnn.Dropout
-    activation: Callable = eqx.static_field()
+    activation: Callable = eqx.field(static=True)
 
     @staticmethod
     def init(config: HyenaConfig, *, key):
@@ -323,7 +415,7 @@ class HyenaOperator(eqx.Module):
         # Input projection: d_model -> (order + 1) * d_model
         in_proj = hnn.Linear.init(
             In=config.Embed,
-            Out=Axis("expanded", (config.order + 1) * config.hidden_dim),
+            Out=Axis("embed_all_orders", (config.order + 1) * config.hidden_dim),
             key=keys[0],
             use_bias=config.use_bias,
         )
@@ -335,14 +427,10 @@ class HyenaOperator(eqx.Module):
 
         # Short filter (local convolution)
         total_width = config.hidden_dim * (config.order + 1)
-        # Haliax Conv has a different signature than Conv1d, we need to adapt it
-        InChannels = Axis("in_channels", total_width)
-        OutChannels = Axis("out_channels", total_width)
-        Spatial = Axis("position", config.seq_len)
         short_filter = hnn.Conv.init(
-            Spatial,
-            InChannels,
-            OutChannels,
+            Spatial=config.Pos,
+            In=Axis("in_channels", total_width),
+            Out=Axis("out_channels", total_width),
             kernel_size=config.short_filter_order,
             groups=total_width,
             padding=config.short_filter_order - 1,
@@ -379,55 +467,83 @@ class HyenaOperator(eqx.Module):
 
     @named_call
     def __call__(self, u, *, key=None):
-        k1, k2 = haliax.jax_utils.maybe_rng_split(key, 2) if key is not None else (None, None)
+        key_in_proj, key_dropout = haliax.jax_utils.maybe_rng_split(key, 2)
 
-        # Input projection
-        u = self.in_proj(u, key=k1)
+        assert u.resolve_axis("position") == self.config.Pos
+        Pos = self.config.Pos
+        Order = Axis("order", self.config.order + 1)
+        Embed = self.config.Embed
 
-        # Reshape for processing
-        batch_size, seq_len, total_channels = u.shape
-        u = u.reshape(batch_size, seq_len, self.config.order + 1, self.config.hidden_dim)
+        # Create axes for blocks and other dimensions
+        Block = self.config.Block
+        PosPerBlock = Axis("pos_per_block", self.config.seq_len // self.config.num_blocks)
+        Head = self.config.Head
+        EmbedPerHead = self.config.EmbedPerHead
 
-        # Apply short filter (local convolution)
-        u_reshaped = u.reshape(batch_size, seq_len, -1)
-        u_for_conv = u_reshaped.transpose(0, 2, 1)  # [batch, channels, seq_len]
+        # Input projection from [Embed] to [(order+1) * Embed]
+        u = self.in_proj(u, key=key_in_proj)
 
-        # Apply convolution
-        u_short_conv = self.short_filter(u_for_conv)
+        # For the short filter, we need to reshape to a format where channels come first
+        EmbedAllOrders = self.in_proj.Out
+        u = u.rearrange((EmbedAllOrders, Pos))
+        # trying to keep the variable names from the official impl.
+        # I think uc stands for "u convolved".
+        uc = self.short_filter(u)
 
-        # Transpose back to [batch, seq_len, channels]
-        u_short = u_short_conv.transpose(0, 2, 1)
-        u_short = u_short.reshape(batch_size, seq_len, self.config.order + 1, self.config.hidden_dim)
+        # Now we need to reshape to match the PyTorch implementation's:
+        # 'b (ho v) (z l) -> b ho v z l'
+        # we don't have b (we vmap over it).
 
-        # Extract the components
-        *x, v = jnp.split(u_short, self.config.order + 1, axis=2)
-        v = v.squeeze(2)  # Remove the singleton dimension
+        uc = hax.unflatten_axis(uc, Embed, (Head, EmbedPerHead))
+        uc = hax.unflatten_axis(uc, Pos, (Block, PosPerBlock))
+
+        # Extract the components - we'll unbind on the Order axis
+        components = hax.unbind(uc, EmbedPerHead)
+        v = components[-1]  # Last component is v
+        x = components[:-1]  # All others are x components
+        assert len(x) == self.config.order
 
         # Long-range filtering with recurrence
+        # TODO: not done. Go through torch impl and compare.
         for o, x_i in enumerate(reversed(x[1:])):
-            # Compress the order dimension
-            x_i = x_i.squeeze(2)
-
-            # Apply mixing
+            # Apply mixing, handling outer_mixing with Haliax operations
             if self.config.outer_mixing:
-                v = jnp.einsum("bsi,bsj->bsij", v, x_i)
-                v = self.dropout(v, key=k2)
-                v = v.sum(axis=-1)  # Sum over the inner dimension
+                # Get the dimension sizes directly from the NamedArrays
+                v_embed_axis = v.axes[-1]
+                x_embed_axis = x_i.axes[-1]
+
+                # Create axes for the outer product
+                V_dim = Axis("v_dim", v_embed_axis.size)
+                X_dim = Axis("x_dim", x_embed_axis.size)
+
+                # Broadcast to prepare for outer product
+                v_expanded = v.broadcast_axis(X_dim)
+                x_i_expanded = x_i.broadcast_axis(V_dim)
+
+                # Rearrange for proper dimension alignment
+                v_expanded = v_expanded.rearrange((Pos, V_dim, X_dim))
+                x_i_expanded = x_i_expanded.rearrange((Pos, X_dim, V_dim))
+
+                # Transpose the last two dims of x_i_expanded to align with v_expanded
+                x_i_expanded = x_i_expanded.rearrange((Pos, V_dim, X_dim))
+
+                # Multiply for outer product
+                outer_product = v_expanded * x_i_expanded
+                v = self.dropout(outer_product, key=key_dropout)
+
+                # Sum along the X_dim axis to reduce dimensions
+                v = hax.sum(v, X_dim)
             else:
-                v = self.dropout(v * x_i, key=k2)
+                v = self.dropout(v * x_i, key=key_dropout)
 
             # Apply filtering
-            v = self.filter_fn(v, seq_len, key=k2)
-
-            # Apply additional MLP if configured
-            if self.config.post_order_ffn:
-                # This would require additional implementation for the case when post_order_ffn=True
-                pass
+            seq_len = Pos.size
+            v = self.filter_fn(v, seq_len, key=key_dropout)
 
         # First x is special - element-wise product with the filtered result
-        y = self.activation(v * x[0].squeeze(2))
+        y = self.activation(v * x[0])
 
         # Output projection
-        y = self.out_proj(y, key=k2)
+        y = self.out_proj(y, key=key_dropout)
 
         return y
