@@ -19,6 +19,8 @@ import haliax.nn as hnn
 from haliax import Axis
 from haliax.jax_utils import named_call
 
+from levanter.utils.activation import ActivationFunction, ActivationFunctionName
+
 
 @dataclass(frozen=True)
 class HyenaConfig:
@@ -31,7 +33,7 @@ class HyenaConfig:
     inner_factor: int = 1  # inner dimension multiplier
     short_filter_order: int = 3  # length of the explicit input convolutional filter
     outer_mixing: bool = False  # whether to use outer mixing
-    activation: str = "gelu_new"  # activation function
+    activation: ActivationFunctionName = ActivationFunctionName.GELU_NEW
     num_blocks: int = 1  # number of blocks to split the sequence into
     num_heads: int = 1  # number of heads
 
@@ -406,7 +408,7 @@ class HyenaOperator(eqx.Module):
     short_filter: hnn.Conv
     filter_fn: HyenaFilter
     dropout: hnn.Dropout
-    activation: Callable = eqx.field(static=True)
+    activation: ActivationFunction = eqx.field(static=True)
 
     @staticmethod
     def init(config: HyenaConfig, *, key):
@@ -443,18 +445,6 @@ class HyenaOperator(eqx.Module):
         # Dropout
         dropout = hnn.Dropout(pdrop=config.resid_pdrop)
 
-        # Activation function
-        if config.activation == "gelu_new":
-            activation = partial(hnn.gelu, approximate=True)
-        elif config.activation == "gelu":
-            activation = partial(hnn.gelu, approximate=False)
-        elif config.activation == "relu":
-            activation = hnn.relu
-        elif config.activation == "silu" or config.activation == "swish":
-            activation = hnn.silu
-        else:
-            activation = lambda x: x  # Identity
-
         return HyenaOperator(
             config=config,
             in_proj=in_proj,
@@ -462,7 +452,7 @@ class HyenaOperator(eqx.Module):
             short_filter=short_filter,
             filter_fn=filter_fn,
             dropout=dropout,
-            activation=activation,
+            activation=config.activation.to_fn(),
         )
 
     @named_call

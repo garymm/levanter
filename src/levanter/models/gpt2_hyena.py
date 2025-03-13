@@ -226,13 +226,3 @@ class Gpt2HyenaModel(LmHeadModel[Gpt2HyenaConfig]):
 
     def _state_dict_key_map(self) -> Dict[str, Optional[str]]:
         return {"backbone": None, "embeddings": None}
-
-
-ACT2FN: Dict[str, Callable] = {
-    "relu": hnn.relu,
-    "silu": hnn.silu,
-    "swish": hnn.swish,
-    "gelu": partial(hnn.gelu, approximate=False),
-    "gelu_new": partial(hnn.gelu, approximate=True),
-    "quick_gelu": hnn.quick_gelu,
-}
