@@ -51,7 +51,6 @@ class HyenaConfig:
     # General parameters
     resid_pdrop: float = 0.0  # Dropout for residual connections
     use_bias: bool = True  # Whether to use bias in linear layers
-    return_state: bool = False  # Whether to return state information
 
     # Axes
     Pos = property(lambda self: Axis(name="position", size=self.seq_len))
@@ -414,35 +413,32 @@ class HyenaOperator(eqx.Module):
     def init(config: HyenaConfig, *, key):
         keys = jrandom.split(key, 5)
 
-        # Input projection: d_model -> (order + 1) * d_model
+        # Input projection: hidden_size -> (order + 1) * hidden_size
+        EmbedAllOrders = Axis("embed_all_orders", (config.order + 1) * config.hidden_dim)
         in_proj = hnn.Linear.init(
             In=config.Embed,
-            Out=Axis("embed_all_orders", (config.order + 1) * config.hidden_dim),
+            Out=EmbedAllOrders,
             key=keys[0],
             use_bias=config.use_bias,
         )
 
-        # Output projection: d_model -> d_model
+        # Output projection: hidden_size -> hidden_size
         # Create a new axis with the same dimensions to avoid naming collision
-        OutputEmbed = Axis("output_embed", config.hidden_dim)
+        # We do not support inner_factor from the PyTorch impl.
+        OutputEmbed = Axis("output_embed", config.Embed.size)
         out_proj = hnn.Linear.init(In=config.Embed, Out=OutputEmbed, key=keys[1], use_bias=config.use_bias)
 
-        # Short filter (local convolution)
-        total_width = config.hidden_dim * (config.order + 1)
         short_filter = hnn.Conv.init(
             Spatial=config.Pos,
-            In=Axis("in_channels", total_width),
-            Out=Axis("out_channels", total_width),
+            In=EmbedAllOrders,
+            Out=Axis("out_channels", EmbedAllOrders.size),
             kernel_size=config.short_filter_order,
-            groups=total_width,
+            groups=EmbedAllOrders.size,
             padding=config.short_filter_order - 1,
             key=keys[2],
         )
 
-        # Initialize the long-range filter
         filter_fn = HyenaFilter.init(config, key=keys[3])
-
-        # Dropout
         dropout = hnn.Dropout(pdrop=config.resid_pdrop)
 
         return HyenaOperator(
@@ -461,12 +457,9 @@ class HyenaOperator(eqx.Module):
 
         assert u.resolve_axis("position") == self.config.Pos
         Pos = self.config.Pos
-        Order = Axis("order", self.config.order + 1)
         Embed = self.config.Embed
-
-        # Create axes for blocks and other dimensions
         Block = self.config.Block
-        PosPerBlock = Axis("pos_per_block", self.config.seq_len // self.config.num_blocks)
+        PosPerBlock = self.config.PosPerBlock
         Head = self.config.Head
         EmbedPerHead = self.config.EmbedPerHead
 
@@ -496,33 +489,14 @@ class HyenaOperator(eqx.Module):
         # Long-range filtering with recurrence
         # TODO: not done. Go through torch impl and compare.
         for o, x_i in enumerate(reversed(x[1:])):
-            # Apply mixing, handling outer_mixing with Haliax operations
+            # Outer product of EmbedPerHead with EmbedPerHead
             if self.config.outer_mixing:
-                # Get the dimension sizes directly from the NamedArrays
-                v_embed_axis = v.axes[-1]
-                x_embed_axis = x_i.axes[-1]
-
-                # Create axes for the outer product
-                V_dim = Axis("v_dim", v_embed_axis.size)
-                X_dim = Axis("x_dim", x_embed_axis.size)
-
-                # Broadcast to prepare for outer product
-                v_expanded = v.broadcast_axis(X_dim)
-                x_i_expanded = x_i.broadcast_axis(V_dim)
-
-                # Rearrange for proper dimension alignment
-                v_expanded = v_expanded.rearrange((Pos, V_dim, X_dim))
-                x_i_expanded = x_i_expanded.rearrange((Pos, X_dim, V_dim))
-
-                # Transpose the last two dims of x_i_expanded to align with v_expanded
-                x_i_expanded = x_i_expanded.rearrange((Pos, V_dim, X_dim))
-
-                # Multiply for outer product
-                outer_product = v_expanded * x_i_expanded
+                EmbedPerHeadPrime = Axis("EmbedPerHeadPrime", EmbedPerHead.size)
+                assert isinstance(v, hax.NamedArray)  # make type-checker happy
+                v_for_outer = hax.rename(v, {EmbedPerHead: EmbedPerHeadPrime})
+                outer_product = v_for_outer.broadcast_axis(EmbedPerHeadPrime) * x_i
                 v = self.dropout(outer_product, key=key_dropout)
-
-                # Sum along the X_dim axis to reduce dimensions
-                v = hax.sum(v, X_dim)
+                v = hax.sum(v, EmbedPerHeadPrime)
             else:
                 v = self.dropout(v * x_i, key=key_dropout)
 
@@ -530,8 +504,20 @@ class HyenaOperator(eqx.Module):
             seq_len = Pos.size
             v = self.filter_fn(v, seq_len, key=key_dropout)
 
+            # Not currently supporting the post_order_ffn from the PyTorch impl.
+
         # First x is special - element-wise product with the filtered result
-        y = self.activation(v * x[0])
+        v = v * x[0]
+        assert isinstance(v, hax.NamedArray)  # make type-checker happy
+        # merge the head and block axes
+        v = hax.rearrange(
+            v,
+            (
+                f"{Head.name} {EmbedPerHead.name} {Block.name} {PosPerBlock.name} ->"
+                f"({Embed.name}: {Head.name} {EmbedPerHead.name}) ({Pos.name}: {Block.name} {PosPerBlock.name})"
+            ),
+        )
+        y = self.activation(v)
 
         # Output projection
         y = self.out_proj(y, key=key_dropout)
