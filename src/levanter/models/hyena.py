@@ -29,8 +29,8 @@ from levanter.utils.activation import ActivationFunction, ActivationFunctionName
 
 @dataclass(frozen=True)
 class HyenaConfig:
-    seq_len: int = 1024
-    hidden_dim: int = 768
+    seq_len: int = 1024  # l_max from PyTorch impl
+    hidden_dim: int = 768  # d_model from PyTorch impl
 
     # hyena specific parameters
     order: int = 2  # depth of the Hyena recurrence
