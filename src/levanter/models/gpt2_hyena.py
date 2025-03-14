@@ -21,6 +21,7 @@ from levanter.models.attention import AttentionMask
 from levanter.models.hyena import HyenaOperator, HyenaConfig
 from levanter.models.gpt2 import Gpt2Embeddings, Gpt2Mlp
 from levanter.models.lm_model import LmConfig, LmHeadModel
+from levanter.utils.activation import ActivationFunctionName
 
 
 @LmConfig.register_subclass("gpt2_hyena")
@@ -40,7 +41,7 @@ class Gpt2HyenaConfig(LmConfig):
     resid_pdrop: float = 0.0
     hyena_pdrop: float = 0.0
     layer_norm_epsilon: float = 1e-5
-    activation_function: str = "gelu_new"
+    activation_function: ActivationFunctionName = ActivationFunctionName.GELU_NEW
 
     gradient_checkpointing: bool = True  # better to just always use this
     gradient_checkpointing_block_size: int = 5
@@ -106,7 +107,6 @@ class Gpt2HyenaBlock(eqx.Module):
             hidden_dim=config.hidden_dim,
             order=config.hyena_order,
             filter_order=config.hyena_filter_order,
-            inner_factor=config.hyena_inner_factor,
             short_filter_order=config.hyena_short_filter_order,
             outer_mixing=config.hyena_outer_mixing,
             activation=config.activation_function,
@@ -119,8 +119,6 @@ class Gpt2HyenaBlock(eqx.Module):
             shift=config.hyena_shift,
             resid_pdrop=config.resid_pdrop,
             use_bias=config.use_bias,
-            post_order_ffn=config.hyena_post_order_ffn,
-            return_state=config.hyena_return_state,
         )
 
         # Initialize the HyenaOperator directly
@@ -133,7 +131,7 @@ class Gpt2HyenaBlock(eqx.Module):
         return Gpt2HyenaBlock(config, ln_1, hyena_operator, ln_2, mlp, resid_dropout)
 
     @named_call
-    def __call__(self, x: NamedArray, mask: Optional[AttentionMask | NamedArray], layer_idx, *, key):
+    def __call__(self, x: NamedArray, *, key):
         k1, k2, k3, k4 = haliax.jax_utils.maybe_rng_split(key, 4)
 
         # Scale by inverse layer idx if configured (similar to Mistral tweak from the original code)
@@ -168,9 +166,9 @@ class Gpt2HyenaBackbone(ModuleWithStateDictSerialization):
         return Gpt2HyenaBackbone(config, blocks, ln_f)
 
     @named_call
-    def __call__(self, x: NamedArray, attn_mask: Optional[AttentionMask | NamedArray], *, key=None) -> NamedArray:
+    def __call__(self, x: NamedArray, *, key=None) -> NamedArray:
         keys = hax.jax_utils.maybe_rng_split(key, self.config.num_layers) if key is not None else None
-        x = self.blocks.fold(x, attn_mask, hax.arange(self.config.Layers), key=keys)
+        x = self.blocks.fold(x, hax.arange(self.config.Layers), key=keys)
         x = self.ln_f(x)
 
         return x
@@ -211,9 +209,13 @@ class Gpt2HyenaModel(LmHeadModel[Gpt2HyenaConfig]):
     def activations(
         self, input_ids: NamedArray, attn_mask: Optional[AttentionMask | NamedArray] = None, *, key=None
     ) -> NamedArray:
+        # NOTE: attn_mask not used since we use the Hyena operator instead of attention.
+        # TODO: double check HyenaOperator is causal by default.
+        # See test in standalone_hyena.py.
         k_embed, k_backbone = haliax.jax_utils.maybe_rng_split(key, 2)
         x = self.embeddings.embed(input_ids, key=k_embed)
-        x = self.backbone(x, attn_mask, key=k_backbone)
+
+        x = self.backbone(x, key=k_backbone)
 
         return x
 
