@@ -71,55 +71,6 @@ class HyenaConfig:
             raise ValueError(f"seq_len {self.seq_len} must be divisible by num_blocks {self.num_blocks}")
 
 
-class ImplicitFilterMLP(eqx.Module):
-    """MLP for the implicit filter in Hyena."""
-
-    input_proj: hnn.Linear
-    hidden_projs: list
-    output_proj: hnn.Linear
-    sin_activations: list
-
-    @staticmethod
-    def init(FilterEmbed: Axis, Order: Axis, Out: Axis, use_bias: bool, num_hidden_layers: int = 2, *, key):
-        keys = jrandom.split(key, num_hidden_layers + 2)
-
-        # Input projection
-        input_proj = hnn.Linear.init(In=FilterEmbed, Out=Order, key=keys[0], use_bias=use_bias)
-
-        # Hidden projections
-        hidden_projs = []
-        sin_activations = []
-
-        for i in range(num_hidden_layers):
-            # Create a unique filter order axis for each hidden layer to avoid naming collisions
-            InFilterAxis = Order.alias(f"filter_in_{i}")
-            OutFilterAxis = Order.alias(f"filter_out_{i}")
-
-            hidden_projs.append(
-                hnn.Linear.init(In=InFilterAxis, Out=OutFilterAxis, key=keys[i + 1], use_bias=use_bias)
-            )
-            sin_activations.append(Sin.init(Order, w=1))
-
-        # Add an activation for the input projection
-        sin_activations.insert(0, Sin.init(Order, w=1))
-
-        # Output projection - use a different axis name to avoid embedding axis collision
-        LastFilterAxis = Order.alias(f"filter_out_{num_hidden_layers-1}")
-        output_proj = hnn.Linear.init(In=LastFilterAxis, Out=Out, key=keys[-1], use_bias=False)
-
-        return ImplicitFilterMLP(input_proj, hidden_projs, output_proj, sin_activations)
-
-    def __call__(self, x, *, key=None):
-        x = self.input_proj(x)
-        x = self.sin_activations[0](x)
-
-        for proj, act in zip(self.hidden_projs, self.sin_activations[1:]):
-            x = proj(x)
-            x = act(x)
-
-        return self.output_proj(x)
-
-
 class PositionalEmbedding(eqx.Module):
     """Complex exponential positional embeddings for Hyena filters."""
 
@@ -295,7 +246,7 @@ def fft_conv(u, k, bias=None):
 class HyenaFilter(eqx.Module):
     """Implicit long filter with modulation for Hyena."""
 
-    implicit_filter: ImplicitFilterMLP
+    implicit_filter: hax.nn.MLP
     modulation: ExponentialModulation
     pos_emb: PositionalEmbedding
     bias: jnp.ndarray
@@ -307,20 +258,18 @@ class HyenaFilter(eqx.Module):
     def init(config: HyenaConfig, *, key):
         keys = jrandom.split(key, 4)
 
-        # Initialize positional embedding
         pos_emb = PositionalEmbedding.init(config.Pos, config.filter_emb_dim, key=keys[0])
 
-        # Initialize implicit filter MLP
-        implicit_filter = ImplicitFilterMLP.init(
-            FilterEmbed=config.FilterEmbed,
-            Order=config.FilterOrder,
-            Out=config.Embed,
+        implicit_filter = hax.nn.MLP.init(
+            Input=config.FilterEmbed,
+            width=config.FilterOrder,
+            Output=config.Embed,
+            depth=config.num_hidden_layers_filter_mlp,
+            activation=Sin.init(config.FilterOrder, w=1),
             use_bias=config.use_bias,
-            num_hidden_layers=config.num_hidden_layers_filter_mlp,
             key=keys[1],
         )
 
-        # Initialize modulation
         modulation = ExponentialModulation.init(
             config.Embed,
             config.fast_decay_pct,
@@ -331,10 +280,8 @@ class HyenaFilter(eqx.Module):
             key=keys[2],
         )
 
-        # Initialize bias
         bias = jrandom.normal(keys[3], (config.hidden_dim,))
 
-        # Dropout
         dropout = hnn.Dropout(pdrop=config.filter_dropout)
 
         return HyenaFilter(
@@ -347,12 +294,9 @@ class HyenaFilter(eqx.Module):
         h = self.modulation(t, h)
 
         if self.normalized:
-            # Implement L1 norm manually since jnp.norm isn't recognized
-            # Compute sum of absolute values along the sequence dimension
+            # Implement L1 norm manually since there's no haliax.norm
             h_abs = hax.abs(h)
-            # Use where parameter instead of keepdims
             norm_values = hax.sum(h_abs, axis=h.axes[1], where=None)
-            # Reshape and broadcast the norm values
             h = h / norm_values.broadcast_axis(h.axes[1])
 
         return h
