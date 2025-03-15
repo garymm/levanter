@@ -378,7 +378,8 @@ class HyenaOperator(eqx.Module):
         Pos = self.config.Pos
         Block = self.config.Block
         PosPerBlock = self.config.PosPerBlock
-        EmbedAllOrders = self.config.EmbedOrderPlus1
+        EmbedOrderPlus1 = self.config.EmbedOrderPlus1
+        Embed = self.config.Embed
         # input has the same axis name as the Pos axis, but possibly different size
         input_length = u.axis_size(Pos.name)
         l_filter = min(input_length, Pos.size)
@@ -388,7 +389,7 @@ class HyenaOperator(eqx.Module):
 
         # trying to keep the variable names from the official impl.
         # I think uc stands for "u convolved".
-        uc = self.short_filter(u).rename({"out_channels": EmbedAllOrders})
+        uc = self.short_filter(u).rename({"out_channels": EmbedOrderPlus1})
         uc = uc.slice(Pos, length=l_filter)
 
         # Now we need to reshape to match the PyTorch implementation's:
@@ -397,10 +398,9 @@ class HyenaOperator(eqx.Module):
         # we don't have ho (hard-coding num_heads to 1)
         uc = hax.unflatten_axis(uc, Pos, (Block, PosPerBlock))
 
-        # Extract the components - we'll unbind on the Order axis
-        components = hax.unbind(uc, EmbedAllOrders)
-        v = components[-1]  # Last component is v
-        x = components[:-1]  # All others are x components
+        components = hax.split(uc, EmbedOrderPlus1, [Embed] * (self.config.order + 1))
+        v = components[-1]
+        x = components[:-1]
         assert len(x) == self.config.order
         filters = self.filter_fn.generate_filters(l_filter, key=key_dropout)
         filters = hax.unflatten_axis(
@@ -410,13 +410,13 @@ class HyenaOperator(eqx.Module):
 
         # Long-range filtering with recurrence
         for filter_order, x_i in enumerate(reversed(x[1:])):
-            # Outer product of EmbedAllOrders with EmbedAllOrders
+            # Outer product of Embed with Embed
             if self.config.outer_mixing:
-                EmbedAllOrdersPrime = EmbedAllOrders.alias("embed_all_orders_prime")
-                v_for_outer = hax.rename(typing.cast(hax.NamedArray, v), {EmbedAllOrders: EmbedAllOrdersPrime})
-                outer_product = v_for_outer.broadcast_axis(EmbedAllOrdersPrime) * x_i
+                EmbedPrime = self.config.Embed.alias("embed_prime")
+                v_for_outer = hax.rename(v, {Embed: EmbedPrime})
+                outer_product = v_for_outer.broadcast_axis(EmbedPrime) * x_i
                 v = self.dropout(outer_product, key=key_dropout)
-                v = hax.sum(v, EmbedAllOrdersPrime)
+                v = hax.sum(v, EmbedPrime)
             else:
                 v = self.dropout(v * x_i, key=key_dropout)
 
@@ -427,10 +427,10 @@ class HyenaOperator(eqx.Module):
         v = v * x[0]
         # flatten the block axis
         v = hax.rearrange(
-            typing.cast(hax.NamedArray, v),
+            v,
             (
-                f"{EmbedAllOrders.name} {Block.name} {PosPerBlock.name} ->"
-                f"{EmbedAllOrders.name} ({Pos.name}: {Block.name} {PosPerBlock.name})"
+                f"{EmbedOrderPlus1.name} {Block.name} {PosPerBlock.name} ->"
+                f"{EmbedOrderPlus1.name} ({Pos.name}: {Block.name} {PosPerBlock.name})"
             ),
         )
         y = self.activation(v)
