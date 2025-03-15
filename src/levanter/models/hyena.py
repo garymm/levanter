@@ -16,6 +16,7 @@ import typing
 
 import equinox as eqx
 import haliax
+import jax
 import jax.numpy as jnp
 import jax.random as jrandom
 from jaxtyping import PRNGKeyArray
@@ -206,7 +207,7 @@ class Sin(eqx.Module):
         return hax.sin(self.freq * x)
 
 
-def fft_conv(u, k, bias=None):
+def fft_conv(u: jax.Array, k: jax.Array, bias=None) -> jax.Array:
     """JAX implementation of FFT convolution."""
     seqlen = u.shape[-2]
     fft_size = 2 * seqlen
@@ -311,7 +312,12 @@ class HyenaFilter(eqx.Module):
 
         bias = bias if self.use_bias else jnp.zeros_like(bias)
 
-        y = fft_conv(x, k, bias)
+        # fft_conv is not haliax aware so we have to rearrange and pass in raw arrays.
+        x_arr = hax.rearrange(x, ()).array  # TODO
+        k_arr = hax.rearrange(k, ()).array  # TODO
+
+        y_arr = fft_conv(x_arr, k_arr, bias)
+        y = hax.named(y_arr, x.axes)
 
         if key is not None and self.dropout.pdrop > 0:
             dropout_key = haliax.jax_utils.maybe_rng_split(key, 1)[0]
